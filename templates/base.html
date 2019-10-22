@@ -19,6 +19,8 @@
 
 	<link rel="stylesheet" href="{{ url_for('static', filename='darkmode.css') }}{{ g.cache_bust }}">
 
+	<script src="{{ url_for('static', filename='actions.js') }}{{ g.cache_bust }}"></script>
+
 	<script src="{{ url_for('static', filename='expand-post.js') }}{{ g.cache_bust }}"></script>
 
 	{% if request.sub and request.sub != 'all' %}
@@ -34,13 +36,14 @@
 	{% else %}
 	<title>ieddit</title>
 	{% endif %}
+
 </head>
 <body class="bg-light">
 <div class='background-contain'>
 <div class='page-continer'>
 <div class="page mx-auto">
 	<nav class="navbar navbar-expand-lg navbar-light rounded">
-		<a class="navbar-brand" href="/">ieddit<small style="font-size:50%;"> alpha</small></a>
+		<a class="navbar-brand" href="/">ieddit</a>
 
 		<div class="collapse navbar-collapse" id="navbarSupportedContent">
 			<ul class="navbar-nav mr-auto navbar-right">
@@ -50,31 +53,32 @@
 					<a class="nav-link" href="/i/{{ request.sub }}">/i/{{ request.sub }}</a>
 				</li>
 				<li class="nav-item active">
-					<a class="nav-link" href="/i/{{ request.sub }}/info/"><button type="button" class="btn btn-sm btn-primary">information</button></a>
-				</li>
-				<li class="nav-item">
-					<a class="nav-link" href="/create_post"><button type="button" class="btn btn-sm btn-success">Create Post +</button></a>
+					<a class="nav-link" href="/i/{{ request.sub }}/info/"><button type="button" class="btn btn-sm btn-primary"><i class='fa fa-gears'></i> information</button></a>
 				</li>
 				{% else %}
 				<li class="nav-item active" style="margin-top: 0.25rem;">
 					<a class="nav-link" href="/about/">about</a>
 				</li>
 				<li class="nav-item">
-					<a class="nav-link" href="/i/all"><button type="button" class="btn btn-sm btn-danger">/i/all</button></a>
+					<a class="nav-link" href="/i/all"><button type="button" class="btn btn-sm btn-danger">/i/all <i class='fa fa-users'></i></button></a>
 				</li>
 				{% endif %}
 
 				{% if request.sub and request.sub != 'all' %}
 				{% if session['username'] %}
+				<form action='/i/{{ request.sub }}/block' method='POST'>
+				<li class='nav-item nav-link'>
+				<input type='hidden' name='lol' value='1'>
 				{% if request.sub in session['blocked_subs'] %}
-				<li class="nav-item">
-					<a class="nav-link" href="/i/{{ request.sub }}/block"><button type="button" class="btn btn-sm btn-danger">unblock</button></a>
-				</li>
+					<button type='submit' formmethod='POST' fromaction='/i/{{ request.sub }}/block'  name='subscribe' value='0' class='btn btn-sm btn-success'>subscribe <i class='fa fa-star'></i></button>
 				{% else %}
-				<li class="nav-item">
-					<a class="nav-link" href="/i/{{ request.sub }}/block"><button type="button" class="btn btn-sm btn-danger">block</button></a>
-				</li>
+					<button type='submit' formmethod='POST' fromaction='/i/{{ request.sub }}/block' name='subscribe' value='0' class='btn btn-sm btn-danger	'>unsubscribe <i class='fa fa-ban'></i></button>
 				{% endif %}
+			</li>
+				</form>
+				<li class="nav-item">
+					<a class="nav-link" href="/create_post"><button type="button" class="btn btn-sm btn-success">Create Post +</button></a>
+				</li>
 				{% endif %}
 
 				{% else %}
@@ -82,7 +86,7 @@
 					<a class="nav-link" href="/create"><button type="button" class="btn btn-sm btn-primary">Create Sub +</button></a>
 				</li>
 				<li class="nav-item">
-					<a class="nav-link" href="/explore/"><button type="button" class="btn btn-sm btn-success">Explore</button></a>
+					<a class="nav-link" href="/explore/"><button type="button" class="btn btn-sm btn-success">Explore <i class='fa fa-paper-plane'></i></button></a>
 				</li>
 				{% endif %}
 				{% if session['username'] %}
@@ -92,12 +96,14 @@
 				{% endif %}
 			</ul>
 		</div>
-		<div class="navbar">
+		<div class="navbar" id='user-nav' style='max-height: 56px; height: 56px; overflow: hidden;'>
 			<ul class="navbar-nav mr-auto navbar-right">
 				{% if session['username'] %}
+				<div id='top-username' stlye='height: 24px; max-height: 24px; overflow: hidden;'>
 				<li class="nav-item active">
-					<a class="nav-link" href="/u/{{ session['username'] }}"><i class="fa fa-user user-icon-link"></i> {{ session['username'] }}</a>
+					<a style='display: inline; max-width: 150px; overflow: hidden;' class="nav-link" href="/u/{{ session['username'] }}"><div style='display: inline-block;'><i style='display: inline-block; width: 1rem; height: 1rem; margin-right: -0.25rem;' class="fa fa-user user-icon-link"></i> <div id='inner-user-text' style='display: inline; overflow: hidden;'><div id='textcap' style=' display:inline-block; max-width: 126px;'>{{ session['username'] }}</div></div></div></a>
 				</li>
+			</div>
 				{% else %}
 				<li class="nav-item">
 					<a class="nav-link" href="/login/"><button type="button" class="btn btn-sm btn-secondary">Login</button></a>
@@ -118,7 +124,7 @@
 			</ul>
 			{% endif %}
 		</div>
-		<div class="navbar">
+		<div class="navbar" style='padding-left: 0px; padding-right: 0px;'>
 			<button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarSupportedContent" aria-controls="navbarSupportedContent" aria-expanded="false" aria-label="Toggle navigation">
 
 			<span class="navbar-toggler-icon"></span>
@@ -129,7 +135,8 @@
 </div>
 	{% with messages = get_flashed_messages(with_categories=true) %}
 		{% if messages %}
-			<ul class='flashes generic-alert' onload="autoFadeAlert()">
+		<div id='alert-container' class='bg-light'>
+			<ul class='flashes generic-alert bg-light' onload="autoFadeAlert()">
 			{% for category, message in messages %}
 			<div class="alert alert-dismissible alert-{{ category }} fade show" role="alert">
 				{{ message }}
@@ -139,6 +146,7 @@
 			</div>
 			{% endfor %}
 			</ul>
+		</div>
 		{% endif %}
 	{% endwith %}
 </div>

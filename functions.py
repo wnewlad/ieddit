@@ -134,12 +134,36 @@ def split_link(sst, s):
 	new_s.append(s[sindex+len(sst[1])+1:])
 	return new_s
 
+def get_tag_count(text):
+	
+	
+	tag_count = len(re.findall('<[a-zA-Z0-9]*>[^<>"\']*<\/[a-zA-Z0-9]*>', text))
+	tag_count += text.count('<br>')
+	if text.find('\n') != -1:
+		tag_count += text.count('\n')
+	elif text.find('\r\n') != -1:
+		tag_count += text.count('\r\n')
+
+	
+	return tag_count
+
 def pseudo_markup(text):
+	
 	# preserve more than 1 newline
+	text_len = len(text)
 	mtext = text.splitlines()
+
+	# if text is too long, too many tagss, etc
+	text = html.escape(text).replace('&lt;br&gt;', '').replace('\n', '<br>')
+
+	max_escaped_len = 40000
+	max_tag_count = 500
+	current_tag_count = 0
+	current_len = 0
 
 	for i in range(0, len(mtext)):
 		mtext[i] = clean(markdown(mtext[i]), strip=True) 
+
 		regstrs = ['<[^liu].*>.*<\/[^liu]>', '^<[^liu].*>', '<\/[^liu].*>$']
 
 		reg2 = ['<li>.*<\/li>', '<ul>.*<\/ul>', '<code>.*<\/code>', '<blockquote>.*<\/blockquote>']
@@ -160,13 +184,20 @@ def pseudo_markup(text):
 			if len(re.findall('^https?:\/\/.*.*$', mtext[i])) == 0:
 					mtext[i] = mtext[i] + '<br>'
 
+		current_len += len(mtext[i])
+		current_tag_count += get_tag_count(mtext[i])
+
+		
+		if current_len >= max_escaped_len or current_tag_count >= max_tag_count:
+			return text
+
 	# code tags
 	start, end = 0, 0
 	found = False
 
 	for i in range(len(mtext)):
 		if mtext[i].find('```') != -1:
-			#print(mtext[i])
+			#
 			if not found:
 				startindex = i
 				start = mtext[i].find('```')
@@ -176,9 +207,20 @@ def pseudo_markup(text):
 				end = mtext[i].find('```')
 				mtext[startindex] = mtext[startindex][0:start] + '<pre class="inline-code"><code class="inner-code">' + mtext[startindex][start:]
 				mtext[i] = mtext[i][0:end] + '</code></pre>' + mtext[i][end+3:]
+
+				current_len += len(mtext[startindex])
+				current_len += len(mtext[i])
+
 				found = False
 				start = 0
 				end = 0
+
+		current_len += len(mtext[i])
+		current_tag_count += get_tag_count(mtext[i])
+		
+		
+		if current_len >= max_escaped_len or current_tag_count >= max_tag_count:
+			return text
 
 	for i in range(len(mtext)):
 		# different variations of possible links, space at start, no
@@ -218,16 +260,14 @@ def pseudo_markup(text):
 			if len(re.findall('$<a> href=".*"<br>', mtext[i])) == 0:
 				mtext[i] += '<br>'
 
-
+		current_len += len(mtext[i])
+		current_tag_count += get_tag_count(mtext[i])
+		
+		if current_len >= max_escaped_len or current_tag_count >= max_tag_count:
+			return text
 
 	mtext = '\n'.join([x for x in mtext])
 
-	'''
-	for i in range(len(mtext)):
-		if mtext[i][-1:] == '\n':
-			if mtext[i][-2:] != '>\n':
-				mtext[i].replace('\n','<br>')
-	'''
 
 	repstrings = ['</blockquote>']
 	for i in range(len(mtext)):
@@ -267,7 +307,7 @@ def pseudo_markup(text):
 
 	if mtext == '':
 		return '<br>'
-
+	
 	return mtext
 
 epoch = datetime(1970, 1, 1)
@@ -301,4 +341,3 @@ def get_youtube_vid_id(url):
 		return url.split('.be/')[1]
 
 	return False
-

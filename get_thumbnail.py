@@ -27,7 +27,7 @@ def create_thumbnail(r, tid):
 	#im.save('thumbnails/' + str(tid) + '.JPEG', 'JPEG')
 	im.save('static/thumbnails/thumb-' + str(tid) + '.PNG', 'PNG')
 	#r = requests.get('http://127.0.0.1/clear_cache')
-	print(r.text)
+	#print(r.text)
 
 def main():
 	c = False

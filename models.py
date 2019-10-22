@@ -1,8 +1,8 @@
 from flask_sqlalchemy import SQLAlchemy
 from flask import Flask, render_template, session, request
 from datetime import datetime, timedelta
-from flask_caching import Cache
 from functions import *
+from sqlalchemy import orm
 
 app = Flask(__name__)
 app.config.from_object('config')
@@ -22,6 +22,14 @@ class Iuser(db.Model):
 	hide_sub_style = db.Column(db.Boolean, default=False, nullable=False)
 	pgp = db.Column(db.Boolean, default=False, nullable=False)
 
+	def get_recent_comments(self, limit=15, deleted=False):
+		coms = db.session.query(Comment).filter_by(author_id=self.id, deleted=deleted).order_by(Comment.created.desc()).limit(limit).all()
+		return coms
+
+	def get_recent_posts(self, limit=15, deleted=False):
+		posts = db.session.query(Post).filter_by(author_id=self.id, deleted=deleted).order_by(Post.created.desc()).limit(limit).all()
+		return posts
+
 	def __repr__(self):
 		return '<Iuser %r>' % self.username
 
@@ -36,11 +44,15 @@ class Sub(db.Model):
 	nsfw = db.Column(db.Boolean, default=False, nullable=False)
 	css = db.Column(db.String(20000), default=None)
 
-	def get_comments(self):
-		self.comments = db.session.query(Comment).filter_by(sub_name=self.name)
+	def get_comments(self, deleted=False, count=False):
+		if count == True:
+			return db.session.query(Comment).filter_by(sub_name=self.name, deleted=deleted).count()
+		return db.session.query(Comment).filter_by(sub_name=self.name, deleted=deleted)
 
-	def get_posts(self):
-		self.posts = db.session.query(Post).filter_by(sub=self.name)
+	def get_posts(self, deleted=False, count=False):
+		if count == True:
+			return db.session.query(Post).filter_by(sub=self.name, deleted=deleted).count()
+		return db.session.query(Post).filter_by(sub=self.name, deleted=deleted)
 
 	def __repr__(self):
 		return '<Sub %r>' % self.name
@@ -69,6 +81,15 @@ class Post(db.Model):
 	nsfw = db.Column(db.Boolean, default=False, nullable=False)
 	remote_image_url = db.Column(db.String(2000), default=None, nullable=True)
 
+	def get_permalink(self):
+		return config.URL + urllib.parse.urlparse(self.permalink).path
+
+	def has_voted(self, user_id):
+		return db.session.query(Vote).filter_by(post_id=self.id, user_id=user_id).first()
+
+	def get_score(self):
+		return (self.ups - self.downs)
+
 	def __repr__(self):
 		return '<Post %r>' % self.id
 
@@ -90,15 +111,25 @@ class Comment(db.Model):
 	anonymous = db.Column(db.Boolean, default=False, nullable=False)
 	edited = db.Column(db.Boolean, default=False, nullable=False)
 
+	def get_permalink(self):
+		return config.URL + urllib.parse.urlparse(self.permalink).path
+
 	def get_children(self, deleted=False):
-		if deleted == None:
-			return db.session.query(Comment).filter_by(parent_id=self.id).all()
-		return db.session.query(Comment).filter_by(parent_id=self.id, deleted=deleted).all()
+		if deleted == False:
+			return db.session.query(Comment).filter_by(parent_id=self.id, deleted=deleted)
+		return db.session.query(Comment).filter_by(parent_id=self.id)
 
 	def child_count(self, deleted=False):
-		if deleted == None:
-			return db.session.query(Comment).filter_by(parent_id=self.id).count()
-		return db.session.query(Comment).filter_by(parent_id=self.id, deleted=deleted).count()
+		if deleted == False:
+			return db.session.query(Comment).filter_by(parent_id=self.id, deleted=False).count()
+		return db.session.query(Comment).filter_by(parent_id=self.id).count()
+
+	def users_voted(self):
+		users = db.session.query(Vote).filter_by(comment_id=self.id)
+		return users
+
+	def get_score(self):
+		return int(self.ups) - int(self.downs)
 
 	def __repr__(self):
 		return '<Comment %r>' % self.id
@@ -109,6 +140,7 @@ class Vote(db.Model):
 	comment_id = db.Column(db.Integer, db.ForeignKey('comment.id'), nullable=True)
 	vote = db.Column(db.Integer, nullable=False)
 	user_id = db.Column(db.Integer, db.ForeignKey('iuser.id'), nullable=False)
+	created = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
 	def __repr__(self):
 		return '<Vote %r>' % self.id
@@ -136,7 +168,7 @@ class Mod_action(db.Model):
 class Message(db.Model):
 	id = db.Column(db.Integer, primary_key=True)
 	title = db.Column(db.String(400), unique=False, nullable=False)
-	text = db.Column(db.String(20000), unique=False, nullable=False)
+	text = db.Column(db.String(40000), unique=False, nullable=False)
 	read = db.Column(db.Boolean, default=False, nullable=False)
 	sent_to = db.Column(db.String(20), db.ForeignKey('iuser.username'), nullable=False)
 	sender = db.Column(db.String(20), db.ForeignKey('iuser.username'), default=None, nullable=True)
@@ -145,6 +177,7 @@ class Message(db.Model):
 	anonymous = db.Column(db.Boolean, default=False, nullable=False)
 	sender_type = db.Column(db.String(20), default='user', nullable=False)
 	encrypted = db.Column(db.Boolean, default=False, nullable=False)
+	encrypted_key_id = db.Column(db.Integer, db.ForeignKey('pgp.id'), default=None, nullable=True)
 
 	def __repr__(self):
 		return '<Message %r>' % self.id
@@ -187,7 +220,17 @@ class Pgp(db.Model):
 		return '<Pgp %r>' % self.id
 
 
+class Hidden(db.Model):
+	id = db.Column(db.Integer, primary_key=True)
+	post_id = db.Column(db.Integer, db.ForeignKey('post.id'), nullable=True)
+	comment_id = db.Column(db.Integer, db.ForeignKey('comment.id'), nullable=True)
+	username = db.Column(db.String(20), db.ForeignKey('iuser.username'), nullable=False)	
+	other_user = db.Column(db.Integer, db.ForeignKey('iuser.id'), nullable=True)
+
+	def __repr__(self):
+		return '<Hidden %r>' % self.id
 
 
-
-
+if __name__ == '__main__':
+	db.create_all()
+	db.session.commit()

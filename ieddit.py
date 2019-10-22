@@ -40,6 +40,7 @@ if (config.SENTRY_ENABLED):
 	)
 
 db = SQLAlchemy(app)
+db.session.rollback()
 
 Session(app)
 captcha = FlaskSessionCaptcha(app)
@@ -50,10 +51,13 @@ limiter = Limiter(
 	default_limits=config.LIMITER_DEFAULTS
 )
 
+cache.clear()
+
 cache_bust = '?' + str(time.time()).split('.')[0]
 
 @app.before_request
 def before_request():
+
 	g.cache_bust = cache_bust
 
 	if app.debug:
@@ -92,6 +96,10 @@ def before_request():
 	if 'username' in session:
 		has_messages(session['username'])
 
+	if 'blocked' not in session:
+		session['blocked'] = {'comment_id':[], 'post_id':[], 'other_user':[]}
+
+
 	# disabled due to lack of use
 
 	#if 'set_darkmode_initial' not in session:
@@ -105,6 +113,11 @@ def before_request():
 
 @app.after_request
 def apply_headers(response):
+	if response.status_code == 500:
+		db.session.rollback()
+		print(str(vars(response)))
+
+
 	response.headers["X-Frame-Options"] = "SAMEORIGIN"
 	response.headers["X-XSS-Protection"] = "1; mode=block"
 	response.headers['X-Content-Type-Options'] = 'nosniff'
@@ -122,18 +135,27 @@ def apply_headers(response):
 			load_time = str(time.time() - g.start)
 			print('\n[Load: %s]' % load_time)
 
+
 	if request.environ['REQUEST_METHOD'] == 'POST':
 		cache.clear()
 
 
 	return response
 
+
+@app.teardown_request
+def teardown_request(exception):
+	if exception:
+		db.session.rollback()
+	db.session.remove()
+
+
 def only_cache_get(*args, **kwargs):
 	if request.method == 'GET':
 		return False
 	return True
 
-@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
+#@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
 def get_style(sub=None):
 	if sub != None:
 		sub = db.session.query(Sub).filter_by(name=normalize_sub(sub)).first()
@@ -143,6 +165,14 @@ def get_style(sub=None):
 app.jinja_env.globals.update(get_style=get_style)
 
 
+def catch_all_exceptions(f):
+	@wraps(f)
+	def decorated_function(*args, **kwargs):
+		try:
+			return f(*args, **kwargs)
+		except Exception as e:
+			print('\n\nCaught unkown error in catch_all_exceptions wrapped function %s .\n\n' % f, e)
+	return decorated_function
 
 def notbanned(f):
 	@wraps(f)
@@ -276,10 +306,12 @@ def is_admin(username):
 def set_rate_limit():
 	if 'username' in session:
 		session['rate_limit'] = int(time.time()) + (config.RATE_LIMIT_TIME)
-		cache.clear()
+		#cache.clear()
 
 @cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
 def normalize_username(username, dbuser=False):
+	if username == None:
+		return False
 	username = db.session.query(Iuser).filter(func.lower(Iuser.username) == func.lower(username)).first()
 	if username != None:
 		if dbuser:
@@ -295,13 +327,44 @@ def normalize_sub(sub):
 	return sub
 
 @cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
-def get_all_subs():
-	return db.session.query(Sub).all()
+def get_all_subs(explore=False):
+	subs = db.session.query(Sub).all()
+	if explore == False:
+		return subs
+	else:
+		esubs = []
+		for sub in subs:
+			if hasattr(sub, 'rules'):
+				if sub.rules != None:
+					sub.new_rules = pseudo_markup(sub.rules)
+
+			if hasattr(sub, 'rules'):
+				if sub.rules != None:
+					sub.new_rules = pseudo_markup(sub.rules)
+
+			sub.posts = sub.get_posts(count=True)
+
+			if sub.posts == 0:
+				continue
+
+			sub.comments = sub.get_comments(count=True)
+			sub.score = sub.comments + sub.posts
+
+			esubs.append(sub)
+
+		esubs.sort(key=lambda x: x.score, reverse=True)
+		return esubs
 
 
 @cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
 def get_pgp_from_username(username):
-	pgp = db.session.query(Pgp).filter_by(username=normalize_username(username)).first()
+	u = normalize_username(username)
+	if u == False:
+		return False
+
+	else:
+		pgp = db.session.query(Pgp).filter_by(username=normalize_username(username)).first()
+	
 	if pgp != None:
 		return pgp
 	return False
@@ -311,6 +374,12 @@ def get_user_from_name(username):
 	if username == '' or username == False or username == None:
 		return False
 	return normalize_username(username, dbuser=True)
+
+@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
+def get_user_from_id(uid):
+	if uid == None or uid == False:
+		return False
+	return db.session.query(Iuser).filter_by(id=uid).first()
 
 @app.route('/login/',  methods=['GET', 'POST'])
 #@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
@@ -355,7 +424,7 @@ def login():
 						session['anonymous'] = True
 				session['darkmode'] = login_user.darkmode
 
-				if login_user.pgp:
+				if get_pgp_from_username(login_user.username):
 					session['pgp_enabled'] = True
 
 
@@ -421,23 +490,23 @@ def register():
 		session['user_id'] = new_user.id
 		set_rate_limit()
 
-		cache.clear()
+		#cache.clear()
 
 		return redirect(config.URL, 302)
 
-#@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
 @app.route('/')
+#@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
 def index():
 	return subi(subi='all', nsfw=False)
 
-@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
+#@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
 def is_sub_nsfw(sub):
 	s = db.session.query(Sub).filter_by(name=sub).first()
 	if s.nsfw:
 		return True
 	return False
 
-@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
+#@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
 def get_subi(subi, user_id=None, posts_only=False, deleted=False, offset=0, limit=15, nsfw=True, d=None, s=None):
 	if offset != None:
 		offset = int(offset)
@@ -514,7 +583,17 @@ def get_subi(subi, user_id=None, posts_only=False, deleted=False, offset=0, limi
 	if subi != 'all':
 		sticky = db.session.query(Post).filter(func.lower(Post.sub) == subi.lower(), Post.stickied == True).first()
 		if sticky:
-			posts.insert(0, sticky)
+			if 'blocked_subs' in session:
+				if sticky.sub in session['blocked_subs']:
+					pass
+				else:
+					posts.insert(0, sticky)
+			else:
+				posts.insert(0, sticky)
+
+	if 'blocked' in session:
+		posts = [post for post in posts if post.id not in session['blocked']['post_id']]
+		posts = [post for post in posts if post.author_id not in session['blocked']['other_user']]
 
 
 	if more and len(posts) > 0:
@@ -528,7 +607,7 @@ def get_subi(subi, user_id=None, posts_only=False, deleted=False, offset=0, limi
 			post.sub_nsfw = False
 
 		if hasattr(post, 'text'):
-			post.text = pseudo_markup(post.text)
+			post.new_text = pseudo_markup(post.text)
 		if thumb_exists(post.id):
 			post.thumbnail = 'thumbnails/thumb-' + str(post.id) + '.PNG'
 
@@ -543,9 +622,11 @@ def get_subi(subi, user_id=None, posts_only=False, deleted=False, offset=0, limi
 		post.remote_url_parsed = post_url_parse(post.url)
 		post.comment_count = db.session.query(Comment).filter_by(post_id=post.id).count()
 		if 'user_id' in session and 'username' in session:
-			post.has_voted = db.session.query(Vote).filter_by(post_id=post.id, user_id=session['user_id']).first()
-			if post.has_voted != None:
-				post.has_voted = post.has_voted.vote
+
+			v = post.has_voted(session['user_id'])
+			if v != None:
+				post.has_voted = v.vote
+
 			if db.session.query(db.session.query(Moderator).filter(Moderator.username.like(session['username']), Moderator.sub.like(post.sub)).exists()).scalar():
 				post.is_mod = True
 		p.append(post)
@@ -558,6 +639,7 @@ def subi(subi, user_id=None, posts_only=False, offset=0, limit=15, nsfw=True, sh
 	d = request.args.get('d')
 	s = request.args.get('s')
 	subi = normalize_sub(subi)
+	active_sub_users = db.session.query(Post).filter_by(sub=subi).group_by(Post.author).count()
 	if request.environ['QUERY_STRING'] == '':
 		session['off_url'] = request.url + '?offset=15'
 		session['prev_off_url'] = request.url
@@ -603,64 +685,48 @@ def subi(subi, user_id=None, posts_only=False, offset=0, limit=15, nsfw=True, sh
 	for p in sub_posts:
 		if hasattr(p, 'self_text'):
 			if p.self_text != None:
-				p.self_text = pseudo_markup(p.self_text)
+				p.new_self_text = pseudo_markup(p.self_text)
+
 
 	if posts_only:
 		return sub_posts
+	(posts, comments, users, bans, messages, mod_actions, subs, votes, daycoms, dayposts, dayvotes,
+	 dayusers, timediff, uptime, subscripts) = get_stats(subi=subi)
+	return render_template('sub.html', posts=sub_posts, url=config.URL, show_top=show_top, active_sub_users=active_sub_users, dayposts=dayposts)
 
-	return render_template('sub.html', posts=sub_posts, url=config.URL, show_top=show_top)
-
-	#return str(hasattr(request.environ, 'QUERY_STRING'))#str(vars(request))
 
 @cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
-def recursive_children(r=[], comment=None, sort='hot', current_depth=0, max_depth=5, deleted=False):
-	if str(type(comment)) == 'list':
-		for c in comments:
-			if c not in r:
-				recursive_children(comment=c, sort=sort, deleted=deleted)
+def get_cached_children(comment, deleted=False):
+	return comment.get_children(deleted=deleted)
 
-	if comment != None:
-		if deleted == False:
-			if comment.deleted == False:
-				r.append(comment)
+@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
+def recursive_children(comment=None, current_depth=0, max_depth=8, deleted=False):
+	found_children = []
+	found_children.append(comment)
+	children = comment.get_children(deleted=deleted).all()
 
-		elif deleted == True:
-			if comment.deleted == True:
-				r.append(comment)
-
-		else:
-			r.append(comment)
-	else:
-		return r
-
-	if comment.child_count() == 0:
-		return r
-
-	else:
-		children = comment.get_children(deleted=deleted)
-		if sort == 'hot':
-			for c in children:
-				c.score = hot(c.ups, c.downs, c.created)
-			children.sort(key=lambda x: x.score, reverse=True)
-		elif sort == 'new':
-			children.sort(key=lambda x: x.created, reverse=True)
-		elif sort == 'top':
-			children.sort(key=lambda x: (x.ups - x.downs), reverse=True)
-
+	while len(children) > 0 and current_depth < max_depth :
+		print(children)
 		for c in children:
-			current_depth += 1
-			if current_depth == max_depth:
-				return r
-			recursive_children(r=r, comment=c, current_depth=current_depth, max_depth=max_depth, sort=sort)
-	return r
+			print(c)
+			if c not in found_children:
+				found_children.append(c)
+				c2 = c.get_children(deleted=deleted).all()
+				if c2 != None:
+					[children.append(c3) for c3 in c2]
+			ex = [x for x in children if x != c]
+		children = ex
+		current_depth += 1
+
+	return found_children
 
 @cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
-def c_get_comments(sub=None, post_id=None, inurl_title=None, comment_id=False, sort_by=None, comments_only=False, user_id=None):
+def c_get_comments(sub=None, post_id=None, inurl_title=None, comment_id=False, sort_by=None, comments_only=False, user_id=None, deleted=False):
 	post = None
 	parent_comment = None
 	if not comments_only:
 		if post_id != None:
-			post = db.session.query(Post).filter_by(id=post_id, sub=sub).first()
+			post = db.session.query(Post).filter_by(id=post_id).first()
 			post.mods = get_sub_mods(post.sub)
 			post.comment_count = db.session.query(Comment).filter_by(post_id=post.id).count()
 			post.created_ago = time_ago(post.created)
@@ -671,41 +737,64 @@ def c_get_comments(sub=None, post_id=None, inurl_title=None, comment_id=False, s
 			else:
 				post.sub_nsfw = False
 			if hasattr(post, 'text'):
-				post.text = pseudo_markup(post.text)
+				post.new_text = pseudo_markup(post.text)
+			
 			if thumb_exists(post.id):
 				post.thumbnail = 'thumbnails/thumb-' + str(post.id) + '.PNG'
+			elif hasattr(post, 'url'):
+				post.thumbnail = 'globe.png'
+
+
 			if hasattr(post, 'self_text'):
 				if post.self_text != None:
-					post.self_text = pseudo_markup(post.self_text)
+					post.new_self_text = pseudo_markup(post.self_text)
 
 			if get_youtube_vid_id(post.url):
 				post.video = 'https://www.youtube.com/embed/%s?version=3&enablejsapi=1' % get_youtube_vid_id(post.url)
 
 		else:
 			post = None
+
 		if 'user_id' in session:
 			post.has_voted = db.session.query(Vote).filter_by(post_id=post.id, user_id=session['user_id']).first()
 			if post.has_voted != None:
 				post.has_voted = post.has_voted.vote	
 
-		if not comment_id:
-			comments = recursive_children(db.session.query(Comment).filter_by(post_id=post.id).all())
-			parent_comment = None
-			parent_posturl = None
+		if comment_id == None:
+			print(1)
+			comments = db.session.query(Comment).filter_by(post_id=post_id, deleted=deleted).all()
+			show_blocked = False
+		
 		else:
+			print(2)
+			comments = []
 			parent_comment = db.session.query(Comment).filter_by(id=comment_id).first()
-			comments = recursive_children(comment=parent_comment)
+			show_blocked = False
+
+			# if direct link, just show it 
+			if parent_comment.id in session['blocked']['comment_id'] or parent_comment.author_id in session['blocked']['other_user']:
+				flash('you are viewing a comment you have blocked', 'danger')
+				show_blocked = True
+
+			comments = recursive_children(comment=parent_comment, deleted=True)
 			
 	else:
+		print(3)
 		comments = db.session.query(Comment).filter(Comment.author_id == user_id,
-			Comment.deleted == False).order_by(Comment.created.desc()).all()
-
+			Comment.deleted == deleted).order_by(Comment.created.desc()).all()
+		show_blocked = False
 
 	if 'blocked_subs' in session and 'username' in session:
 		comments = [c for c in comments if c.sub_name not in session['blocked_subs']]
 
+	if 'blocked' in session and show_blocked != True:
+		comments = [c for c in comments if c.id not in session['blocked']['comment_id']]
+		comments = [c for c in comments if c.id not in session['blocked']['other_user']]
+
+	#print(comments)
 	for c in comments:
-		c.text = pseudo_markup(c.text)
+		c.score = (c.ups - c.downs)
+		c.new_text = pseudo_markup(c.text)
 		c.mods = get_sub_mods(c.sub_name)
 		c.created_ago = time_ago(c.created)
 		if 'user_id' in session:
@@ -725,39 +814,60 @@ def c_get_comments(sub=None, post_id=None, inurl_title=None, comment_id=False, s
 @app.route('/i/<sub>/<post_id>/<inurl_title>/sort-<sort_by>')
 @app.route('/i/<sub>/<post_id>/<inurl_title>/')
 #@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
-def get_comments(sub=None, post_id=None, inurl_title=None, comment_id=False, sort_by=None, comments_only=False, user_id=None):
-	if sub == None or post_id == None or inurl_title == None:
-		if not comments_only:
-			return 'badlink'
+def get_comments(sub=None, post_id=None, inurl_title=None, comment_id=None, sort_by=None, comments_only=False, user_id=None):
+	print(comment_id)
 	try:
-		int(comment_id)
-	except:
-		comment_id = False
-	sub = normalize_sub(sub)
+		if sub == None or post_id == None or inurl_title == None:
+			if not comments_only:
+				return 'badlink'
 
-	comments, post, parent_comment = c_get_comments(sub=sub, post_id=post_id, inurl_title=inurl_title, comment_id=comment_id, sort_by=sort_by, comments_only=comments_only, user_id=user_id)
+		sub = normalize_sub(sub)
+
+		if comment_id == None:
+			is_parent = False
+		else:
+			is_parent = True
+
+		comments, post, parent_comment = c_get_comments(sub=sub, post_id=post_id, inurl_title=inurl_title, comment_id=comment_id, sort_by=sort_by, comments_only=comments_only, user_id=user_id)
+		
+		if post != None and 'username' in session:
+			if db.session.query(db.session.query(Moderator).filter(Moderator.username.like(session['username']), Moderator.sub.like(post.sub)).exists()).scalar():
+				post.is_mod = True
 	
-	if post != None and 'username' in session:
-		if db.session.query(db.session.query(Moderator).filter(Moderator.username.like(session['username']), Moderator.sub.like(post.sub)).exists()).scalar():
-			post.is_mod = True
+		if comments_only:
+			return comments
+	
+		if not comment_id:
+			tree = create_id_tree(comments)
+		else:
+			tree = create_id_tree(comments, parent_id=comment_id)
+	
+		tree = comment_structure(comments, tree)
 
-	if comments_only:
-		return comments
+		last = '%s/i/%s/%s/%s/' % (config.URL, sub, post_id, post.inurl_title)
 
-	if not comment_id:
-		tree = create_id_tree(comments)
-	else:
-		tree = create_id_tree(comments, parent_id=comment_id)
+		if comment_id != False and comment_id != None:
+			last = last + str(comment_id)
 
-	tree = comment_structure(comments, tree)
-	return render_template('comments.html', comments=comments, post_id=post_id, 
-		post_url='%s/i/%s/%s/%s/' % (config.URL, sub, post_id, post.inurl_title), 
-		post=post, tree=tree, parent_comment=parent_comment)
+		session['last_return_url'] = last
+
+		return render_template('comments.html', comments=comments, post_id=post_id, 
+			post_url='%s/i/%s/%s/%s/' % (config.URL, sub, post_id, post.inurl_title), 
+			post=post, tree=tree, parent_comment=parent_comment, is_parent=is_parent,
+			config=config)
+	except Exception as e:
+		print(str(e))
+		return(str(e))
+		db.session.rollback()
+
+
+
 
 # need to entirely rewrite how comments are handled once everything else is complete
 # this sort of recursion KILLS performance, especially when combined with the already
 # terrible comment_structure function.
-@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
+
+#@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
 def list_of_child_comments(comment_id, sort_by=None):
 	comments = {}
 	current_comments = []
@@ -783,6 +893,7 @@ def list_of_child_comments(comment_id, sort_by=None):
 				current_comments.append(c.id)
 				comments[c.id] = c
 			current_comments.remove(current_c)
+	print(comments)
 	return comments
 
 @app.route('/create', methods=['POST', 'GET'])
@@ -794,6 +905,7 @@ def create_sub():
 		if subname.lower() == 'all':
 			flash('reserved name')
 			return redirect(url_for('create_sub'))
+
 		if config.CAPTCHA_ENABLE:
 			if request.form.get('captcha') == '':
 				flash('no captcha', 'danger')
@@ -807,6 +919,7 @@ def create_sub():
 				if rl > 0:
 					flash('rate limited, try again in %s seconds' % str(rl), 'danger')
 					return redirect('/')
+
 		if subname != None and verify_subname(subname) and 'username' in session:
 			if len(subname) > 30 or len(subname) < 1:
 				return 'invalid length'
@@ -839,8 +952,8 @@ def create_sub():
 			return redirect(url_for('login'))
 		return render_template('create.html')
 
-@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
 @app.route('/u/<username>/', methods=['GET'])
+#@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
 def view_user(username):
 	vuser = db.session.query(Iuser).filter(func.lower(Iuser.username) == func.lower(username)).first()
 	mod_of = db.session.query(Moderator).filter_by(username=vuser.username).all()
@@ -848,19 +961,39 @@ def view_user(username):
 	for s in mod_of:
 		mods[s.sub] = s.rank
 	vuser.mods = mods
-	posts = subi('all', user_id=vuser.id, posts_only=True)
-	posts = posts[:10]
+
+	posts = vuser.get_recent_posts()#.all()
+	comments = vuser.get_recent_comments()#.all()
+
+	print(posts)
 	for p in posts:
+		print(p)
+		p.created_ago = time_ago(p.created)
+		p.comment_count = db.session.query(Comment).filter_by(post_id=p.id).count()
 		p.mods = get_sub_mods(p.sub)
-	#sub, post_id, inurl_title, comment_id=False, sort_by=None, comments_only=False, user_id=None):
+		if 'user_id' in session:
+			v = p.has_voted(session['user_id'])
+			if v != None:
+				p.has_voted = str(v.vote)
+		if p.self_text != None:
+			p.new_self_text = pseudo_markup(p.self_text)
+
+		p.remote_url_parsed = post_url_parse(p.url)
+
+		if hasattr(p, 'text'):
+			p.new_text = pseudo_markup(p.text)
+		if thumb_exists(p.id):
+			p.thumbnail = 'thumbnails/thumb-' + str(p.id) + '.PNG'
+
 	comments_with_posts = []
-	comments = get_comments(comments_only=True, user_id=vuser.id)[:10]
+
 	for c in comments:
 		c.mods = get_sub_mods(c.sub_name)
 		cpost = db.session.query(Post).filter_by(id=c.post_id).first()
 		comments_with_posts.append((c, cpost))
 
-
+		c.new_text = pseudo_markup(c.text)
+		c.created_ago = time_ago(c.created)
 		if 'user_id' in session:
 			c.has_voted = db.session.query(Vote).filter_by(comment_id=c.id, user_id=session['user_id']).first()
 			if c.has_voted != None:
@@ -930,11 +1063,12 @@ def vote(post_id=None, comment_id=None, vote=None, user_id=None):
 				if last_vote.post_id != None:
 					vpost = db.session.query(Post).filter_by(id=last_vote.post_id).first()
 				elif last_vote.comment_id != None:
-					vpost = db.session.query(Comment).filter_by(id=last_vote.post_id).first()
+					vpost = db.session.query(Comment).filter_by(id=last_vote.comment_id).first()
 				if last_vote.vote == 1:
 					vpost.ups -= 1
 				elif last_vote.vote == -1:
 					vpost.downs -= 1
+
 			db.session.delete(last_vote)
 			db.session.commit()
 
@@ -1117,15 +1251,13 @@ def create_post(postsub=None):
 		session['previous_post_form'] = None
 		return render_template('create_post.html', postsub=postsub, sppf=sppf)
 
-
-@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
 @app.route('/get_sub_list', methods=['GET'])
 def get_sub_list():
 	subs = get_all_subs()
 	if subs != None:
 		for s in subs:
-			s.get_comments()
-			s.get_posts()
+			s.comments = s.get_comments()
+			s.posts = s.get_posts()
 			if s.comments != None and s.posts != None:
 				s.rank = s.comments.count() + s.posts.count()
 			else:
@@ -1153,11 +1285,27 @@ def create_comment():
 	sub_name = request.form.get('sub_name')
 	anonymous = request.form.get('anonymous')
 
-	if 'rate_limit' in session and config.RATE_LIMIT == True:
-		rl = session['rate_limit'] - time.time()
-		if rl > 0:
-			flash('rate limited, try again in %s seconds' % str(rl))
+	if config.CAPTCHA_ENABLE and config.CAPTCHA_COMMENTS:
+		if request.form.get('captcha') == '':
+			flash('no captcha', 'danger')
+			if 'last_return_url' in session:
+				return redirect(session['last_return_url'])
 			return redirect('/')
+
+		if captcha.validate() == False:
+			flash('invalid captcha', 'danger')
+			if 'last_return_url' in session:
+				return redirect(session['last_return_url'])
+			return redirect('/')
+
+
+		if 'rate_limit' in session and config.RATE_LIMIT == True:
+			rl = session['rate_limit'] - time.time()
+			if rl > 0:
+				flash('rate limited, try again in %s seconds' % str(rl), 'danger')
+				if 'last_return_url' in session:
+					return redirect(session['last_return_url'])
+				return redirect('/')
 
 	if anonymous != None:
 		anonymous = True
@@ -1188,14 +1336,14 @@ def create_comment():
 	post = db.session.query(Post).filter_by(id=post_id).first()
 	if post.locked == True:
 		flash('post is locked', 'danger')
-		return redirect(post.permalink)
+		return redirect(post.get_permalink())
 
 	deleted = False
 	sub = normalize_sub(sub_name)
 	if sub in get_banned_subs(session['username']):
 		deleted = True
 		#flash('you are banned from commenting', 'danger')
-		#return redirect(post.permalink)
+		#return redirect(post.get_permalink())
 	sub_name = sub
 
 	new_comment = Comment(post_id=post_id, sub_name = sub_name, text=text,
@@ -1204,8 +1352,7 @@ def create_comment():
 	db.session.add(new_comment)
 	db.session.commit()
 	
-
-	new_comment.permalink = post.permalink +  str(new_comment.id)
+	new_comment.permalink = post.get_permalink() +  str(new_comment.id)
 
 	if is_admin(session['username']) and anonymous == False:
 		new_comment.author_type = 'admin'
@@ -1239,16 +1386,18 @@ def create_comment():
 		if not deleted:
 			if post.author != session['username']:
 				new_message = Message(title='comment reply', text=new_comment.text, sender=sender, sender_type=new_comment.author_type,
-					sent_to=post.author, in_reply_to=post.permalink, anonymous=anonymous)
+					sent_to=post.author, in_reply_to=post.get_permalink(), anonymous=anonymous)
 				db.session.add(new_message)
 				db.session.commit()
 
 	set_rate_limit()
 
+	flash('created new comment', 'success')
 	return redirect(post_url, 302)
 
-def send_message(title=None, text=None, sent_to=None, sender=None, in_reply_to=None, encrypted=False):
-	new_message = Message(title=title, text=text, sent_to=sent_to, sender=sender, in_reply_to=in_reply_to, encrypted=encrypted)
+def send_message(title=None, text=None, sent_to=None, sender=None, in_reply_to=None, encrypted=False, encrypted_key_id=None):
+	new_message = Message(title=title, text=text, sent_to=sent_to, sender=sender,
+		in_reply_to=in_reply_to, encrypted=encrypted, encrypted_key_id=encrypted_key_id)
 	db.session.add(new_message)
 	db.session.commit()
 
@@ -1271,12 +1420,24 @@ def user_messages(username=None):
 			read = read.order_by((Message.created).desc()).limit(50).all()
 			unread = unread.order_by((Message.created).desc()).limit(50).all()
 
+			read = [x for x in read if x.sender == None or get_user_from_name(x.sender).id not in session['blocked']['other_user']]
+			unread = [x for x in unread if x.sender == None or get_user_from_name(x.sender).id not in session['blocked']['other_user']]
+
+			for r in unread:
+				r.read = True
+
+			sent = db.session.query(Message).filter_by(sender=username, read=False)
+			sent = sent.order_by((Message.created).desc()).limit(5).all()
+
+			for s in sent:
+				s.is_sent = True
+				if s.encrypted:
+					s.new_text = '<p style="color: green;">ENCRYPTED</p>'
 
 			for r in read:
 				if r.encrypted == False:
-					r.text = pseudo_markup(r.text)
+					r.new_text = pseudo_markup(r.text)
 				else:
-					#r.text = r.text.replace('<br>', '')
 					r.sender_pgp = get_pgp_from_username(r.sender)
 				if r.in_reply_to != None:
 					r.ppath = r.in_reply_to.replace(config.URL, '')
@@ -1285,19 +1446,14 @@ def user_messages(username=None):
 			
 			session['has_messages'] = False
 			session['unread_messages'] = None
-
-			for r in unread:
-				r.read = True
 			
 			db.session.commit()
 
 			for r in unread:
 				if r.encrypted == False:
-					r.text = pseudo_markup(r.text)
+					r.new_text = pseudo_markup(r.text)
 				else:
-					#r.text = r.text.replace('<br>');
 					r.sender_pgp = get_pgp_from_username(r.sender)
-					#r.sender_pubkey = r.sender_pubkey = r.sender_pubkey.pubkey
 				if r.in_reply_to != None:
 					r.ppath = r.in_reply_to.replace(config.URL, '')
 				if r.encrypted == True:
@@ -1308,7 +1464,8 @@ def user_messages(username=None):
 			else:
 				self_pgp = False
 
-			return render_template('messages.html', read=read, unread=unread, has_encrypted=has_encrypted, self_pgp=self_pgp)
+			return render_template('messages.html', read=read, unread=unread, has_encrypted=has_encrypted, self_pgp=self_pgp,
+				sent=sent)
 
 @app.route('/u/<username>/messages/reply/<mid>', methods=['GET'])
 #@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
@@ -1325,16 +1482,19 @@ def reply_message(username=None, mid=None):
 		flash('invalid message id', 'danger')
 		return redirect('/')
 	else:
-		m.text = pseudo_markup(m.text)
+		m.new_text = pseudo_markup(m.text)
 		if hasattr(m, 'in_reply_to'):
 			if m.in_reply_to != None:
 				m.ppath = m.in_reply_to.replace(config.URL, '')
+
+
 		return render_template('message_reply.html', message=m, sendto=False, self_pgp=get_pgp_from_username(session['username']),
 			other_pgp=get_pgp_from_username(m.sender), other_user=get_user_from_name(username))
 
-def sendmsg(title=None, text=None, sender=None, sent_to=None, encrypted=False):
 
-	new_message = Message(title=title, text=text, sender=sender, sent_to=sent_to, encrypted=encrypted)
+def sendmsg(title=None, text=None, sender=None, sent_to=None, encrypted=False, encrypted_key_id=None, in_reply_to=None):
+	new_message = Message(title=title, text=text, sender=sender, in_reply_to=in_reply_to, sent_to=sent_to, encrypted=encrypted, 
+		encrypted_key_id=encrypted_key_id)
 	db.session.add(new_message)
 	db.session.commit()
 
@@ -1349,12 +1509,18 @@ def msg(username=None):
 		text = request.form.get('message_text')
 		title = request.form.get('message_title')
 		sent_to = request.form.get('sent_to')
-		encrypted = request.form.get('encrypted')
+		encrypted = request.form.get('msgencrypted')
+		encrypted_key_id = request.form.get('key_id')
 
-		if encrypted != None:
+		if encrypted == 'true':
 			encrypted = True
+			encrypted_key_id = encrypted_key_id
 		else:
 			encrypted = False
+			encrypted_key_id = None
+
+		if encrypted_key_id == '':
+			encrypted_key_id = None
 
 		if sent_to == None:
 			sent_to = username
@@ -1375,7 +1541,8 @@ def msg(username=None):
 
 		sender = session['username']
 
-		sendmsg(title=title, text=text, sender=session['username'], sent_to=sent_to, encrypted=encrypted)
+		sendmsg(title=title, text=text, sender=session['username'], sent_to=sent_to, encrypted=encrypted,
+			encrypted_key_id=encrypted_key_id)
 		
 
 		set_rate_limit()
@@ -1454,7 +1621,7 @@ def description(sub=None):
 		rtext = False
 	else:
 		if subr.rules != None:
-			rtext = pseudo_markup(subr.rules)
+			rtext = subr.rules
 		else:
 			rtext = False
 	return render_template('sub_mods.html', mods=get_sub_mods(sub, admin=False), desc=True, rules=rtext)
@@ -1468,7 +1635,7 @@ def settings(sub=None):
 		return render_template('sub_mods.html', mods=get_sub_mods(sub, admin=False), settings=True, nsfw=subr.nsfw, sub_object=subr)
 	return '403'
 
-#@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
+@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
 def get_blocked_subs(username=None):
 	subs = db.session.query(Sub_block).filter_by(username=session['username']).all()
 	if subs != None:
@@ -1476,8 +1643,7 @@ def get_blocked_subs(username=None):
 	else:
 		return []
 
-@app.route('/i/<sub>/block', methods=['GET'])
-#@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
+@app.route('/i/<sub>/block', methods=['POST'])
 def blocksub(sub=None):
 	if 'username' not in session:
 		flash('not logged in', 'error')
@@ -1491,7 +1657,7 @@ def blocksub(sub=None):
 	else:
 		bsubs = []
 
-	cache.clear()
+	#cache.clear()
 
 	if blocks == None or sub not in bsubs:
 		session['blocked_subs'].append(sub)
@@ -1499,33 +1665,31 @@ def blocksub(sub=None):
 		db.session.add(new_block)
 		db.session.commit()
 		bsubs.append(sub)
-		flash('blocked %s' % sub)
+		flash('unsubscribed from %s' % sub, 'success')
 	else:
 		dblock = db.session.query(Sub_block).filter_by(username=session['username'], sub=sub).first()
 		db.session.delete(dblock)
 		db.session.commit()
 		bsubs = [b for b in bsubs if b != sub]
-		flash('unblocked %s' % sub)
+		flash('subscribed to %s' % sub, 'success')
 
 	session['blocked_subs'] = bsubs
 
 	return redirect('/i/%s/' % sub)
 
 
-#@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
 @app.route('/explore/', methods=['GET'])
 def explore():
-	#sub = normalize_sub(sub)
 	esubs = []
-	subs = db.session.query(Sub).all()
+	subs = get_all_subs(explore=True)
 	for sub in subs:
 		if hasattr(sub, 'rules'):
 			if sub.rules != None:
-				sub.rules = pseudo_markup(sub.rules)
-		sub.posts = db.session.query(Post).filter_by(sub=sub.name).count()
+				sub.new_rules = pseudo_markup(sub.rules)
+		sub.posts = sub.get_posts(count=True)
 		if sub.posts == 0:
 			continue
-		sub.comments = db.session.query(Comment).filter_by(sub_name=sub.name).count()
+		sub.comments = sub.get_comments(count=True)
 		sub.score = sub.comments + sub.posts
 
 		esubs.append(sub)
@@ -1537,10 +1701,12 @@ def explore():
 @app.route('/clear_cache', methods=['GET'])
 def ccache():
 	if request.remote_addr == '127.0.0.1':
-		cache.clear()
+		#cache.clear()
 		return 'cleared'
 
 @app.route('/about/', methods=['GET'])
+@app.route('/readme/', methods=['GET'])
+@app.route('/news/2019/10/21/ieddit-beta-release/', methods=['GET'])
 #@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
 def about():
 	from markdown import markdown
@@ -1554,8 +1720,6 @@ def about():
 def subcomments(sub=None, offset=0, limit=15, s=None):
 	# code is copy pasted from user page... the post stuff can probably be gotten rid of.
 	# the username stuff can be gotten rid of too
-
-
 	mods = {}
 
 	offset = request.args.get('offset')
@@ -1608,8 +1772,10 @@ def subcomments(sub=None, offset=0, limit=15, s=None):
 	else:
 		comments = comments.offset(offset).limit(limit).all()
 
+	comments = [c for c in comments if c.id not in session['blocked']['comment_id'] and c.author_id not in session['blocked']['other_user']]
+
 	for c in comments:
-		c.text = pseudo_markup(c.text)
+		c.new_text = pseudo_markup(c.text)
 		c.mods = get_sub_mods(c.sub_name)
 		cpost = db.session.query(Post).filter_by(id=c.post_id).first()
 		comments_with_posts.append((c, cpost))
@@ -1625,6 +1791,7 @@ def subcomments(sub=None, offset=0, limit=15, s=None):
 						Comment.is_mod = True
 					else:
 						Comment.is_mod = False
+
 
 
 
@@ -1670,47 +1837,68 @@ def subcomments(sub=None, offset=0, limit=15, s=None):
 			session['off_url'] = session['off_url'].replace('/&', '/?')
 
 	if s == 'hot':
+			print(comments)
 			comments.sort(key=lambda x: x.hot, reverse=True)
 
 	return render_template('recentcomments.html', posts=posts, url=config.URL, comments_with_posts=comments_with_posts, no_posts=True)
 
 @cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
-def get_stats():
-	posts = db.session.query(Post).all()
-	comments = db.session.query(Comment).all()
-	users = db.session.query(Iuser).all()
-	bans = db.session.query(Ban).count()
-	messages = db.session.query(Message).count()
-	mod_actions = db.session.query(Mod_action).count()
-	subs = db.session.query(Sub).count()
-	votes = db.session.query(Vote).all()
+def get_stats(subi=None):
+	if subi == None:
+		posts = db.session.query(Post).all()
+		comments = db.session.query(Comment).all()
+		users = db.session.query(Iuser).all()
+		bans = db.session.query(Ban).count()
+		messages = db.session.query(Message).count()
+		mod_actions = db.session.query(Mod_action).count()
+		subs = db.session.query(Sub).count()
+		votes = db.session.query(Vote).all()
+		subscripts = 0
+	else:
+		posts = db.session.query(Post).filter_by(sub=subi).all()
+		comments = db.session.query(Comment).filter_by(sub_name=subi).all()
+		bans = db.session.query(Ban).filter_by(sub=subi).count()
+		mod_actions = db.session.query(Mod_action).filter_by(sub=subi).count()
+		users = []
+		votes = []
+		for v in posts:
+			[votes.append(vv) for vv in db.session.query(Vote).filter_by(post_id=v.id).all()]
+			[users.append(vv) for vv in db.session.query(Iuser).filter_by(username=v.author).all()]
+		for v in comments:
+			[votes.append(vv) for vv in db.session.query(Vote).filter_by(comment_id=v.id).all()]
+			[users.append(vv) for vv in db.session.query(Iuser).filter_by(username=v.author).all()]
+		users_blocked = [n.username for n in db.session.query(Sub_block).filter_by(sub=subi).all()]
+		subscripts = len([u for u in db.session.query(Iuser) if u.username not in users_blocked])
+		messages = 0
+		subs = 0
 
 	daycoms = [c for c in comments if ((datetime.now() - c.created).total_seconds()) < 86400]
 
 
 	dayusers = []
 
-	for u in daycoms:
-		if u.author not in dayusers:
-			dayusers.append(u.author)
+	for uu in daycoms:
+		if uu.author not in dayusers:
+			dayusers.append(uu.author)
 
 	dayposts = [p for p in posts if ((datetime.now() - p.created).total_seconds()) < 86400]
 
-	for u in dayposts:
-		if u.author not in dayusers:
-			dayusers.append(u.author)
+	for uuu in dayposts:
+		if uuu.author not in dayusers:
+			dayusers.append(uuu.author)
 
 	dayvotes = []
 
-	for v in votes:
-		if hasattr(v, 'created'):
-				if((datetime.now() - v.created).total_seconds()) < 86400:
-					dayvotes.append(v)
+	for vvv in votes:
+		if hasattr(vvv, 'created'):
+			if((datetime.utcnow() - vvv.created).total_seconds()) < 86400:
+				dayvotes.append(vvv)
 
-	for v in dayvotes:
-		u = db.session.query(Iuser).filter_by(id=v.user_id)
-		if u.username not in dayusers:
-			dayusers.append(u.username)
+	for vz in dayvotes:
+		new_user = db.session.query(Iuser).filter(Iuser.id == vz.user_id).first()
+		if hasattr(new_user, 'username'):
+			if new_user.username not in dayusers:
+				dayusers.append(new_user.username)
 
 	users = len(users)
 	daycoms = len(daycoms)
@@ -1721,7 +1909,8 @@ def get_stats():
 	# requires user be on linux, and have log file in this location, so this is
 	# only set to try to be calculated on the ieddit prod/dev server. it makes
 	# assumptions that cannot be made for any user on a different setup
-	if config.URL == 'https://ieddit.com' or config.URL == 'http://dev.ieddit.com':
+	if config.URL == 'https://ieddit.com' or config.URL == 'http://dev.ieddit.com' and subi == None:
+		try:
 			fline = str(os.popen('head -n 1 /var/log/nginx/access.log').read()).split(' ')[3][1:]
 			lline = str(os.popen('tail -n 1 /var/log/nginx/access.log').read()).split(' ')[3][1:]
 
@@ -1739,17 +1928,22 @@ def get_stats():
 
 			# cache_bust = '?' + str(time.time()).split('.')[0]
 			uptime = (time.time() - int(cache_bust[1:])) / 60 / 60
-
+		except Exception as e:
+			print(e)
+			timediff, uptime = False, False
+	else:
+		timediff, uptime = False, False
 
 
 	return (len(posts), len(comments), users, bans, messages, mod_actions, subs, len(votes), daycoms, dayposts, dayvotes, dayusers,
-		timediff, uptime)
+		timediff, uptime, subscripts)
 
+@app.route('/i/<subi>/stats/', methods=['GET'])
 @app.route('/stats/', methods=['GET'])
 #@cache.memoize(config.DEFAULT_CACHE_TIME, unless=only_cache_get)
-def stats():
+def stats(subi=None):
 	(posts, comments, users, bans, messages, mod_actions, subs, votes, daycoms, dayposts, dayvotes,
-		dayusers, timediff, uptime) = get_stats()
+		dayusers, timediff, uptime, subscripts) = get_stats(subi=subi)
 
 	if 'admin' in session:
 		debug = str(vars(request))
@@ -1758,9 +1952,7 @@ def stats():
 
 	return render_template('stats.html', posts=posts, dayposts=dayposts, comments=comments, daycoms=daycoms,
 		users=users, bans=bans, messages=messages, mod_actions=mod_actions, subs=subs, votes=votes, dayvotes=dayvotes,
-		dayusers=dayusers, timediff=timediff, uptime=uptime, debug=debug)
-
-
+		dayusers=dayusers, timediff=timediff, uptime=uptime, debug=debug, subi=subi, subscripts=subscripts)
 
 
 from mod import bp
